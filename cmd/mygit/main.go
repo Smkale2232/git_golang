@@ -4,20 +4,29 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
+	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 // Usage: your_git.sh <command> <arg1> <arg2> ...
 func main() {
-	// fmt.Println("Logs from your program will appear here!")
+	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "usage: mygit <command> [<args>...]\n")
 		os.Exit(1)
 	}
+	catfile := flag.NewFlagSet("cat-file", flag.ExitOnError)
+	hashobj := flag.NewFlagSet("hash-object", flag.ExitOnError)
+	lstree := flag.NewFlagSet("ls-tree", flag.ExitOnError)
+	catp := catfile.Bool("p", true, "print type of content")
+	// hashT := hashobj.String("t", "blob", "The type of content")
+	nameOnly := lstree.Bool("name-only", true, "get only the file name")
+	hashW := hashobj.Bool("w", true, "save to the git objects")
 	switch command := os.Args[1]; command {
 	case "init":
 		for _, dir := range []string{".git", ".git/objects", ".git/refs"} {
@@ -25,67 +34,78 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
 			}
 		}
-		headFileContents := []byte("ref: refs/heads/master\n")
+		headFileContents := []byte("ref: refs/heads/main\n")
 		if err := os.WriteFile(".git/HEAD", headFileContents, 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing file: %s\n", err)
 		}
 		fmt.Println("Initialized git directory")
 	case "cat-file":
-		if len(os.Args) == 4 && os.Args[2] == "-p" {
-			sha := os.Args[3]
-			dir := sha[0:2]
-			filename := sha[2:]
-			path := filepath.Join(".git", "objects", dir, filename)
-			b, err := ioutil.ReadFile(path)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error in cat-file p command %s\n", err)
-				os.Exit(1)
-			}
-			buf := bytes.NewBuffer(b)
-			r, err := zlib.NewReader(buf)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error in cat-file p command zlib %s\n", err)
-				os.Exit(1)
-			}
-			defer r.Close()
-			bs, err := io.ReadAll(r)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error in cat-file p command find null char %s\n", err)
-				os.Exit(1)
-			}
-			found := false
-			for _, b := range bs {
-				if found {
-					fmt.Print(string(b))
+		catfile.Parse(os.Args[2:])
+		sha1Hash := strings.Join(catfile.Args(), "")
+		dir, file := sha1Hash[:2], sha1Hash[2:]
+		if _, err := os.Stat(".git/objects/" + dir); !os.IsNotExist(err) {
+			if content, err := os.ReadFile(".git/objects/" + dir + "/" + file); err == nil {
+				decompressor, _ := zlib.NewReader(bytes.NewBuffer(content))
+				con := make([]byte, 1024)
+				decompressor.Read(con)
+				content_split := strings.Split(string(con), "\x00")
+				if *catp {
+					fmt.Print(content_split[1])
 				} else {
-					found = b == 0
+					fmt.Print(content_split[0])
 				}
+			} else {
+				panic(err)
 			}
+		} else {
+			panic(err)
 		}
 	case "hash-object":
-		file, _ := os.ReadFile(os.Args[3])
-		stats, _ := os.Stat(os.Args[3])
-		content := string(file)
-		contentAndHeader := fmt.Sprintf("blob %d\x00%s", stats.Size(), content)
-		sha := (sha1.Sum([]byte(contentAndHeader)))
-		hash := fmt.Sprintf("%x", sha)
-		blobName := []rune(hash)
-		blobPath := ".git/objects/"
-		for i, v := range blobName {
-			blobPath += string(v)
-			if i == 1 {
-				blobPath += "/"
-			}
+		hashobj.Parse(os.Args[2:])
+		filename := hashobj.Args()
+		file_content, err := os.ReadFile(strings.Join(filename, ""))
+		if err != nil {
+			panic(err)
 		}
-		var buffer bytes.Buffer
-		z := zlib.NewWriter(&buffer)
-		z.Write([]byte(contentAndHeader))
-		z.Close()
-		os.MkdirAll(filepath.Dir(blobPath), os.ModePerm)
-		f, _ := os.Create(blobPath)
-		defer f.Close()
-		f.Write(buffer.Bytes())
-		fmt.Print(hash)
+		var sb strings.Builder
+		sb.WriteString("blob ")
+		sb.WriteString(strconv.Itoa(len(file_content)))
+		sb.WriteString("\x00")
+		sb.WriteString(string(file_content))
+		hasher := sha1.New()
+		hasher.Write([]byte(sb.String()))
+		hash := hasher.Sum(nil)
+		if *hashW {
+			dir := fmt.Sprintf("%x", hash[:1])
+			file := fmt.Sprintf("%x", hash[1:])
+			os.MkdirAll(".git/objects/"+dir, 0755)
+			openr, _ := os.Create(".git/objects/" + dir + "/" + file)
+			zlibWriter := zlib.NewWriter(openr)
+			zlibWriter.Write([]byte(sb.String()))
+			zlibWriter.Close()
+			fmt.Print(fmt.Sprintf("%x", hash))
+		} else {
+			fmt.Print(fmt.Sprintf("%x", hash))
+		}
+	case "ls-tree":
+		lstree.Parse(os.Args[2:])
+		restArgs := strings.Join(lstree.Args(), "")
+		dir, file := restArgs[:2], restArgs[2:]
+		filePath := filepath.Join(".git/objects", dir, file)
+		openedFile, _ := os.Open(filePath)
+		zlibReader, _ := zlib.NewReader(openedFile)
+		con, _ := io.ReadAll(zlibReader)
+		if *nameOnly {
+			split := bytes.Split(con, []byte("\x00"))
+			use := split[1 : len(split)-1]
+			for _, dByte := range use {
+				splitter := []byte(" ")
+				splitByte := bytes.Split(dByte, splitter)[1]
+				fmt.Println(string(splitByte))
+			}
+		} else {
+			// Todo parse whole tree
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
