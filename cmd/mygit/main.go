@@ -4,29 +4,23 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
-	"flag"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
-	"strconv"
+	"sort"
 	"strings"
 )
 
-// Usage: your_git.sh <command> <arg1> <arg2> ...
 func main() {
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
+	// fmt.Println("Logs from your program will appear here!")
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "usage: mygit <command> [<args>...]\n")
 		os.Exit(1)
 	}
-	catfile := flag.NewFlagSet("cat-file", flag.ExitOnError)
-	hashobj := flag.NewFlagSet("hash-object", flag.ExitOnError)
-	lstree := flag.NewFlagSet("ls-tree", flag.ExitOnError)
-	catp := catfile.Bool("p", true, "print type of content")
-	// hashT := hashobj.String("t", "blob", "The type of content")
-	nameOnly := lstree.Bool("name-only", true, "get only the file name")
-	hashW := hashobj.Bool("w", true, "save to the git objects")
 	switch command := os.Args[1]; command {
 	case "init":
 		for _, dir := range []string{".git", ".git/objects", ".git/refs"} {
@@ -34,80 +28,156 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
 			}
 		}
-		headFileContents := []byte("ref: refs/heads/main\n")
+		headFileContents := []byte("ref: refs/heads/master\n")
 		if err := os.WriteFile(".git/HEAD", headFileContents, 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing file: %s\n", err)
 		}
 		fmt.Println("Initialized git directory")
 	case "cat-file":
-		catfile.Parse(os.Args[2:])
-		sha1Hash := strings.Join(catfile.Args(), "")
-		dir, file := sha1Hash[:2], sha1Hash[2:]
-		if _, err := os.Stat(".git/objects/" + dir); !os.IsNotExist(err) {
-			if content, err := os.ReadFile(".git/objects/" + dir + "/" + file); err == nil {
-				decompressor, _ := zlib.NewReader(bytes.NewBuffer(content))
-				con := make([]byte, 1024)
-				decompressor.Read(con)
-				content_split := strings.Split(string(con), "\x00")
-				if *catp {
-					fmt.Print(content_split[1])
-				} else {
-					fmt.Print(content_split[0])
-				}
-			} else {
-				panic(err)
+		if len(os.Args) == 4 && os.Args[2] == "-p" {
+			sha := os.Args[3]
+			dir := sha[0:2]
+			filename := sha[2:]
+			path := filepath.Join(".git", "objects", dir, filename)
+			b, err := ioutil.ReadFile(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error in cat-file p command %s\n", err)
+				os.Exit(1)
 			}
-		} else {
-			panic(err)
+			buf := bytes.NewBuffer(b)
+			r, err := zlib.NewReader(buf)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error in cat-file p command zlib %s\n", err)
+				os.Exit(1)
+			}
+			defer r.Close()
+			bs, err := io.ReadAll(r)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error in cat-file p command find null char %s\n", err)
+				os.Exit(1)
+			}
+			found := false
+			for _, b := range bs {
+				if found {
+					fmt.Print(string(b))
+				} else {
+					found = b == 0
+				}
+			}
 		}
 	case "hash-object":
-		hashobj.Parse(os.Args[2:])
-		filename := hashobj.Args()
-		file_content, err := os.ReadFile(strings.Join(filename, ""))
-		if err != nil {
-			panic(err)
-		}
-		var sb strings.Builder
-		sb.WriteString("blob ")
-		sb.WriteString(strconv.Itoa(len(file_content)))
-		sb.WriteString("\x00")
-		sb.WriteString(string(file_content))
-		hasher := sha1.New()
-		hasher.Write([]byte(sb.String()))
-		hash := hasher.Sum(nil)
-		if *hashW {
-			dir := fmt.Sprintf("%x", hash[:1])
-			file := fmt.Sprintf("%x", hash[1:])
-			os.MkdirAll(".git/objects/"+dir, 0755)
-			openr, _ := os.Create(".git/objects/" + dir + "/" + file)
-			zlibWriter := zlib.NewWriter(openr)
-			zlibWriter.Write([]byte(sb.String()))
-			zlibWriter.Close()
-			fmt.Print(fmt.Sprintf("%x", hash))
-		} else {
-			fmt.Print(fmt.Sprintf("%x", hash))
-		}
-	case "ls-tree":
-		lstree.Parse(os.Args[2:])
-		restArgs := strings.Join(lstree.Args(), "")
-		dir, file := restArgs[:2], restArgs[2:]
-		filePath := filepath.Join(".git/objects", dir, file)
-		openedFile, _ := os.Open(filePath)
-		zlibReader, _ := zlib.NewReader(openedFile)
-		con, _ := io.ReadAll(zlibReader)
-		if *nameOnly {
-			split := bytes.Split(con, []byte("\x00"))
-			use := split[1 : len(split)-1]
-			for _, dByte := range use {
-				splitter := []byte(" ")
-				splitByte := bytes.Split(dByte, splitter)[1]
-				fmt.Println(string(splitByte))
+		file, _ := os.ReadFile(os.Args[3])
+		stats, _ := os.Stat(os.Args[3])
+		content := string(file)
+		contentAndHeader := fmt.Sprintf("blob %d\x00%s", stats.Size(), content)
+		sha := (sha1.Sum([]byte(contentAndHeader)))
+		hash := fmt.Sprintf("%x", sha)
+		blobName := []rune(hash)
+		blobPath := ".git/objects/"
+		for i, v := range blobName {
+			blobPath += string(v)
+			if i == 1 {
+				blobPath += "/"
 			}
-		} else {
-			// Todo parse whole tree
 		}
+		var buffer bytes.Buffer
+		z := zlib.NewWriter(&buffer)
+		z.Write([]byte(contentAndHeader))
+		z.Close()
+		os.MkdirAll(filepath.Dir(blobPath), os.ModePerm)
+		f, _ := os.Create(blobPath)
+		defer f.Close()
+		f.Write(buffer.Bytes())
+		fmt.Print(hash)
+	case "ls-tree":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "usage: mygit ls-tree <object>\n")
+			os.Exit(1)
+		}
+		treeSha := os.Args[3]
+		treePath := path.Join(".git", "objects", treeSha[:2], treeSha[2:])
+		reader, err := os.Open(treePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening file: %s\n", err)
+			os.Exit(1)
+		}
+		zlibReader, err := zlib.NewReader(reader)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating zlib reader: %s\n", err)
+			os.Exit(1)
+		}
+		decompressedContents, err := ioutil.ReadAll(zlibReader)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading file: %s\n", err)
+			os.Exit(1)
+		}
+		decompressedContents = decompressedContents[bytes.IndexByte(decompressedContents, 0)+1:]
+		var names []string
+		for len(decompressedContents) > 0 {
+			mode := decompressedContents[:strings.IndexByte(string(decompressedContents), ' ')]
+			decompressedContents = decompressedContents[len(mode)+1:]
+			name := decompressedContents[:strings.IndexByte(string(decompressedContents), 0)]
+			decompressedContents = decompressedContents[len(name)+1:]
+			sha := decompressedContents[:20]
+			decompressedContents = decompressedContents[len(sha):]
+			names = append(names, string(name))
+		}
+		for _, name := range names {
+			fmt.Printf("%s\n", name)
+		}
+	case "write-tree":
+		currentDir, _ := os.Getwd()
+		h, c := calcTreeHash(currentDir)
+		treeHash := hex.EncodeToString(h)
+		os.Mkdir(filepath.Join(".git", "objects", treeHash[:2]), 0755)
+		var compressed bytes.Buffer
+		w := zlib.NewWriter(&compressed)
+		w.Write(c)
+		w.Close()
+		os.WriteFile(filepath.Join(".git", "objects", treeHash[:2], treeHash[2:]), compressed.Bytes(), 0644)
+		fmt.Println(treeHash)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
 	}
+}
+func calcTreeHash(dir string) ([]byte, []byte) {
+	fileInfos, _ := ioutil.ReadDir(dir)
+	type entry struct {
+		fileName string
+		b        []byte
+	}
+	var entries []entry
+	contentSize := 0
+	for _, fileInfo := range fileInfos {
+		if fileInfo.Name() == ".git" {
+			continue
+		}
+		if !fileInfo.IsDir() {
+			f, _ := os.Open(filepath.Join(dir, fileInfo.Name()))
+			b, _ := ioutil.ReadAll(f)
+			s := fmt.Sprintf("blob %d\u0000%s", len(b), string(b))
+			sha1 := sha1.New()
+			io.WriteString(sha1, s)
+			s = fmt.Sprintf("100644 %s\u0000", fileInfo.Name())
+			b = append([]byte(s), sha1.Sum(nil)...)
+			entries = append(entries, entry{fileInfo.Name(), b})
+			contentSize += len(b)
+		} else {
+			b, _ := calcTreeHash(filepath.Join(dir, fileInfo.Name()))
+			s := fmt.Sprintf("40000 %s\u0000", fileInfo.Name())
+			b2 := append([]byte(s), b...)
+			entries = append(entries, entry{fileInfo.Name(), b2})
+			contentSize += len(b2)
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].fileName < entries[j].fileName })
+	s := fmt.Sprintf("tree %d\u0000", contentSize)
+	b := []byte(s)
+	for _, entry := range entries {
+		b = append(b, entry.b...)
+	}
+	sha1 := sha1.New()
+	io.WriteString(sha1, string(b))
+	return sha1.Sum(nil), b
 }
